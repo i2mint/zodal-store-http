@@ -84,17 +84,25 @@ jobs:
           # the old version. See i2mint/zodal#8 — that mask cost a whole debugging cycle.
           pnpm publish --access public $FORCE
 
-      # A publish is only real if the registry serves it. Ask the registry.
+      # A publish is only real if the registry serves it. Ask the registry — but give it a
+      # moment: a brand-new package takes ~40s to become readable, so a single immediate
+      # check false-negatives on every first publish (it did, on this package's own first
+      # release). Retry, then fail for real.
       - name: Verify the registry serves this version
         run: |
           set -euo pipefail
           VERSION=$(node -e "console.log(require('./package.json').version)")
-          got=$(npm view "@zodal/store-http@${VERSION}" version 2>/dev/null || true)
-          if [ "$got" != "$VERSION" ]; then
-            echo "::error::@zodal/store-http@${VERSION} is not on the registry — the publish failed silently."
-            exit 1
-          fi
-          echo "@zodal/store-http@${VERSION} confirmed on the registry"
+          for attempt in $(seq 1 10); do
+            got=$(npm view "@zodal/store-http@${VERSION}" version 2>/dev/null || true)
+            if [ "$got" = "$VERSION" ]; then
+              echo "@zodal/store-http@${VERSION} confirmed on the registry (attempt ${attempt})"
+              exit 0
+            fi
+            echo "not visible yet (attempt ${attempt}/10) — waiting for propagation"
+            sleep 15
+          done
+          echo "::error::@zodal/store-http@${VERSION} never appeared on the registry — the publish failed."
+          exit 1
 
       - name: Configure SSH for git push
         run: |
