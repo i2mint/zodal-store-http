@@ -1,0 +1,9 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.DS_Store
+.turbo/
+
+# This package is pnpm-managed (see "packageManager"). An npm lockfile here is only ever
+# a local-experiment artifact and must not be committed.
+package-lock.json
