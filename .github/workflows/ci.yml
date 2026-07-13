@@ -27,7 +27,7 @@ jobs:
           cache: pnpm
 
       - name: Install dependencies
-        run: pnpm install --no-frozen-lockfile
+        run: pnpm install --frozen-lockfile
 
       - name: Typecheck
         run: pnpm typecheck
@@ -65,7 +65,7 @@ jobs:
           registry-url: https://registry.npmjs.org
 
       - name: Install dependencies
-        run: pnpm install --no-frozen-lockfile
+        run: pnpm install --frozen-lockfile
 
       - name: Build
         run: pnpm build
@@ -74,11 +74,27 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          set -euo pipefail
           FORCE=""
           if [[ "${{ github.event.head_commit.message }}" == *"[force publish]"* ]]; then
             FORCE="--no-git-checks"
           fi
-          pnpm publish --access public $FORCE || true
+          # No `|| true`. An expired NPM_TOKEN makes the registry answer 404 to the PUT,
+          # and swallowing that exit code reports the run green while npm keeps serving
+          # the old version. See i2mint/zodal#8 — that mask cost a whole debugging cycle.
+          pnpm publish --access public $FORCE
+
+      # A publish is only real if the registry serves it. Ask the registry.
+      - name: Verify the registry serves this version
+        run: |
+          set -euo pipefail
+          VERSION=$(node -e "console.log(require('./package.json').version)")
+          got=$(npm view "@zodal/store-http@${VERSION}" version 2>/dev/null || true)
+          if [ "$got" != "$VERSION" ]; then
+            echo "::error::@zodal/store-http@${VERSION} is not on the registry — the publish failed silently."
+            exit 1
+          fi
+          echo "@zodal/store-http@${VERSION} confirmed on the registry"
 
       - name: Configure SSH for git push
         run: |
