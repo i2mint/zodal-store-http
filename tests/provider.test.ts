@@ -85,6 +85,42 @@ describe('createHttpProvider — CRUD', () => {
     expect([...backend.store.keys()]).toEqual(['c']);
   });
 
+  it('create with an existing id rejects with the server\'s 409', async () => {
+    const backend = createMockBackend({ seed: SEED });
+    const error = await makeProvider(backend)
+      .create({ id: 'a', name: 'dup', priority: 0 })
+      .catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(HttpError);
+    expect((error as HttpError).status).toBe(409);
+    expect(backend.store.get('a')!.name).toBe('Zebra');
+  });
+
+  it('updateMany and deleteMany skip ids the server answers 404 for', async () => {
+    const backend = createMockBackend({ seed: SEED });
+    const provider = makeProvider(backend);
+
+    const updated = await provider.updateMany(['a', 'nope'], { priority: 7 });
+    expect(updated.map((r) => r.id)).toEqual(['a']);
+    await provider.deleteMany(['b', 'nope']);
+    expect([...backend.store.keys()].sort()).toEqual(['a', 'c']);
+  });
+
+  it('updateMany and deleteMany still reject on any other error, after every request settles', async () => {
+    const backend = createMockBackend({ seed: SEED });
+    const failing: typeof backend.fetch = (input, init) =>
+      input.endsWith('/c')
+        ? Promise.resolve(new Response('boom', { status: 500, statusText: 'Server Error' }))
+        : backend.fetch(input, init);
+    const provider = makeProvider(backend, { fetch: failing });
+
+    await expect(provider.updateMany(['a', 'c', 'nope'], { priority: 7 })).rejects.toMatchObject({
+      status: 500,
+    });
+    expect(backend.store.get('a')!.priority).toBe(7); // the parallel sibling still ran
+    await expect(provider.deleteMany(['c', 'b'])).rejects.toBeInstanceOf(HttpError);
+    expect(backend.store.has('b')).toBe(false);
+  });
+
   it('percent-encodes ids in the URL', async () => {
     const backend = createMockBackend({ seed: [{ id: 'osoto gari/1', name: 'x', priority: 1 }] });
     const provider = makeProvider(backend);

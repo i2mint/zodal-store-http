@@ -15,21 +15,22 @@
  *
  * **Server capability is opt-in.** By default this provider assumes your endpoint just
  * returns the collection, and it evaluates filter / search / sort / pagination
- * client-side (filtering via `filterToFunction()` from `@zodal/store` — the same
- * evaluator the in-memory provider uses, not a re-implementation). Tell it what the
+ * client-side (through `applyQuery()` from `@zodal/store` — the same evaluator the
+ * in-memory provider uses, not a re-implementation). Tell it what the
  * server really does with `capabilities`, and it delegates exactly that much and no more —
  * which is also what `getCapabilities()` reports, so the UI layer is never lied to.
  */
 
-import type { FilterExpression, SortingState } from '@zodal/core';
+import type { FilterExpression } from '@zodal/core';
 import type {
   DataProvider,
   GetListParams,
   GetListResult,
   ProviderCapabilities,
 } from '@zodal/store';
-import { filterToFunction } from '@zodal/store';
+import { applyQuery, type ApplyQueryOptions } from '@zodal/store';
 import {
+  HttpError,
   httpRequest,
   joinUrl,
   readJson,
@@ -179,22 +180,23 @@ async function _defaultParseList<T>(response: Response): Promise<GetListResult<T
   );
 }
 
-function _compare(a: unknown, b: unknown): number {
-  if (a === b) return 0;
-  if (a == null) return -1;
-  if (b == null) return 1;
-  if (typeof a === 'string' && typeof b === 'string') return a.localeCompare(b);
-  return a < b ? -1 : 1;
-}
-
-function _sortItems<T>(items: T[], sort: SortingState[]): T[] {
-  return [...items].sort((a, b) => {
-    for (const s of sort) {
-      const cmp = _compare((a as Record<string, unknown>)[s.id], (b as Record<string, unknown>)[s.id]);
-      if (cmp !== 0) return s.desc ? -cmp : cmp;
+/**
+ * Run one request per id in parallel, skipping ids the server answers 404 for.
+ *
+ * The bulk half of the DataProvider contract: ids with no item are skipped, while any
+ * other failure (403, 500, network) still rejects — with the first such error, in id
+ * order, once every request has settled.
+ */
+async function _eachSkippingMissing<R>(ids: string[], op: (id: string) => Promise<R>): Promise<R[]> {
+  const settled = await Promise.allSettled(ids.map(op));
+  const done: R[] = [];
+  for (const result of settled) {
+    if (result.status === 'fulfilled') done.push(result.value);
+    else if (!(result.reason instanceof HttpError && result.reason.status === 404)) {
+      throw result.reason;
     }
-    return 0;
-  });
+  }
+  return done;
 }
 
 export function createHttpProvider<T extends Record<string, any>>(
@@ -213,40 +215,30 @@ export function createHttpProvider<T extends Record<string, any>>(
     return joinUrl(baseUrl, id);
   }
 
-  function matchesSearch(item: T, search: string): boolean {
-    const needle = search.toLowerCase();
-    const fields =
-      searchFields ?? Object.keys(item).filter((k) => typeof item[k] === 'string');
-    return fields.some((field) => {
-      const value = item[field];
-      return typeof value === 'string' && value.toLowerCase().includes(needle);
-    });
-  }
-
-  /** Split `getList` params into "the server handles this" and "we handle this". */
-  function planQuery(params: GetListParams): { delegated: GetListParams; local: GetListParams } {
+  /**
+   * Split `getList` params into what the server handles (`delegated`, sent as the query
+   * string) and the steps `applyQuery` must therefore `skip` client-side.
+   */
+  function planQuery(params: GetListParams): {
+    delegated: GetListParams;
+    skip: NonNullable<ApplyQueryOptions['skip']>;
+  } {
     const delegated: GetListParams = {};
-    const local: GetListParams = {};
+    const skip = {
+      filter:
+        !!params.filter && _delegates(capabilities.serverFilter, _filterFields(params.filter)),
+      sort:
+        !!params.sort?.length &&
+        _delegates(capabilities.serverSort, params.sort.map((s) => s.id)),
+      search: capabilities.serverSearch,
+      paginate: capabilities.serverPagination,
+    };
 
-    if (params.filter) {
-      const target = _delegates(capabilities.serverFilter, _filterFields(params.filter))
-        ? delegated
-        : local;
-      target.filter = params.filter;
-    }
-    if (params.sort?.length) {
-      const target = _delegates(capabilities.serverSort, params.sort.map((s) => s.id))
-        ? delegated
-        : local;
-      target.sort = params.sort;
-    }
-    if (params.search) {
-      (capabilities.serverSearch ? delegated : local).search = params.search;
-    }
-    if (params.pagination) {
-      (capabilities.serverPagination ? delegated : local).pagination = params.pagination;
-    }
-    return { delegated, local };
+    if (skip.filter) delegated.filter = params.filter;
+    if (skip.sort) delegated.sort = params.sort;
+    if (skip.search && params.search) delegated.search = params.search;
+    if (skip.paginate && params.pagination) delegated.pagination = params.pagination;
+    return { delegated, skip };
   }
 
   async function getOneItem(id: string): Promise<T> {
@@ -276,25 +268,16 @@ export function createHttpProvider<T extends Record<string, any>>(
 
   return {
     async getList(params: GetListParams): Promise<GetListResult<T>> {
-      const { delegated, local } = planQuery(params);
+      const { delegated, skip } = planQuery(params);
       const url = withQuery(baseUrl, toQuery(delegated));
       const response = await httpRequest(doFetch, { method: 'GET', url, init });
       const parsed = await parseList(response);
 
-      let items = parsed.data;
-      if (local.filter) items = items.filter(filterToFunction<T>(local.filter));
-      if (local.search) items = items.filter((item) => matchesSearch(item, local.search!));
+      // Whatever the server did not do, do here. Items are parsed fresh per response.
+      const local = applyQuery(parsed.data, params, { searchFields, skip });
 
-      // Pre-pagination count. When the server paginated, only it knows the true total.
-      const total = capabilities.serverPagination ? parsed.total : items.length;
-
-      if (local.sort?.length) items = _sortItems(items, local.sort);
-      if (local.pagination) {
-        const { page, pageSize } = local.pagination;
-        items = items.slice((page - 1) * pageSize, page * pageSize);
-      }
-
-      return { data: items, total };
+      // When the server paginates, only it knows the true (pre-pagination) total.
+      return { data: local.data, total: capabilities.serverPagination ? parsed.total : local.total };
     },
 
     getOne(id: string): Promise<T> {
@@ -324,7 +307,7 @@ export function createHttpProvider<T extends Record<string, any>>(
     },
 
     updateMany(ids: string[], data: Partial<T>): Promise<T[]> {
-      return Promise.all(ids.map((id) => updateOne(id, data)));
+      return _eachSkippingMissing(ids, (id) => updateOne(id, data));
     },
 
     delete(id: string): Promise<void> {
@@ -332,7 +315,7 @@ export function createHttpProvider<T extends Record<string, any>>(
     },
 
     async deleteMany(ids: string[]): Promise<void> {
-      await Promise.all(ids.map((id) => deleteOne(id)));
+      await _eachSkippingMissing(ids, deleteOne);
     },
 
     getCapabilities(): ProviderCapabilities {

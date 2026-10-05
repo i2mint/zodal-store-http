@@ -4,9 +4,15 @@
  * Deliberately *dumb* by default — it ignores query parameters entirely — so that any
  * test which observes filtering/sorting/pagination is proving the provider's client-side
  * fallback did the work, not the server. Server-side behaviour is opt-in per test via the
- * `honor` flag, which lets the delegation tests prove the opposite.
+ * `honor` flag, which lets the delegation tests prove the opposite. An honored step is
+ * evaluated with `@zodal/store`'s `applyQuery` (the full filter language, multi-key sort),
+ * standing in for a real server, so the contract kit can run in a delegating mode too.
+ *
+ * A `POST` with an id that already exists answers `409 Conflict`, as a REST server should.
  */
 
+import { applyQuery } from '@zodal/store';
+import type { SortingState } from '@zodal/core';
 import type { FetchLike } from '../src/http.js';
 
 export interface Item extends Record<string, unknown> {
@@ -43,7 +49,7 @@ export interface MockBackendOptions {
   /** Emit an X-Total-Count header on list responses. */
   totalHeader?: number;
   /** Honor server-side query params — off by default, so the dumb path is the default. */
-  honor?: { filter?: boolean; pagination?: boolean; sort?: boolean };
+  honor?: { filter?: boolean; pagination?: boolean; sort?: boolean; search?: boolean };
   /** Answer writes with 204 No Content instead of the resource. */
   noContentOnWrite?: boolean;
 }
@@ -67,10 +73,30 @@ export function createMockBackend(options: MockBackendOptions = {}): MockBackend
     return new Response(JSON.stringify(payload), { status: 200, ...init, headers });
   }
 
-  function listBody(items: Item[]): unknown {
-    if (shape === 'envelope') return { data: items, total: store.size };
-    if (shape === 'custom') return { items, count: store.size };
+  /** `total` is the pre-pagination count (every item, unless a filter/search was honored). */
+  function listBody(items: Item[], total: number): unknown {
+    if (shape === 'envelope') return { data: items, total };
+    if (shape === 'custom') return { items, count: total };
     return items;
+  }
+
+  /** Decode the default `toQuery` convention (page/pageSize, sort, q, filter). */
+  function parseQuery(params: URLSearchParams) {
+    const filter = params.get('filter');
+    const sort = params.get('sort');
+    const page = params.get('page');
+    return {
+      filter: filter ? JSON.parse(filter) : undefined,
+      sort: sort
+        ? sort.split(',').map((key): SortingState =>
+            key.startsWith('-') ? { id: key.slice(1), desc: true } : { id: key, desc: false },
+          )
+        : undefined,
+      search: params.get('q') ?? undefined,
+      pagination: page
+        ? { page: Number(page), pageSize: Number(params.get('pageSize') ?? store.size) }
+        : undefined,
+    };
   }
 
   const fetchImpl: FetchLike = async (input, init) => {
@@ -90,42 +116,22 @@ export function createMockBackend(options: MockBackendOptions = {}): MockBackend
     const path = parsed.pathname;
 
     if (path === basePath && method === 'GET') {
-      let items = [...store.values()];
-
-      if (honor.filter) {
-        const raw = parsed.searchParams.get('filter');
-        if (raw) {
-          const f = JSON.parse(raw) as { field: string; operator: string; value: unknown };
-          items = items.filter((item) =>
-            f.operator === 'gte'
-              ? (item[f.field] as number) >= (f.value as number)
-              : item[f.field] === f.value,
-          );
-        }
-      }
-      if (honor.sort) {
-        const raw = parsed.searchParams.get('sort');
-        if (raw) {
-          const [first] = raw.split(',');
-          const desc = first.startsWith('-');
-          const key = desc ? first.slice(1) : first;
-          items.sort((a, b) => {
-            const cmp = String(a[key]).localeCompare(String(b[key]));
-            return desc ? -cmp : cmp;
-          });
-        }
-      }
-      if (honor.pagination) {
-        const page = Number(parsed.searchParams.get('page') ?? 1);
-        const pageSize = Number(parsed.searchParams.get('pageSize') ?? items.length);
-        items = items.slice((page - 1) * pageSize, page * pageSize);
-      }
-
-      return json(listBody(items));
+      const { data, total } = applyQuery([...store.values()], parseQuery(parsed.searchParams), {
+        skip: {
+          filter: !honor.filter,
+          sort: !honor.sort,
+          search: !honor.search,
+          paginate: !honor.pagination,
+        },
+      });
+      return json(listBody(data, total));
     }
 
     if (path === basePath && method === 'POST') {
       const payload = JSON.parse(String(init?.body ?? '{}')) as Partial<Item>;
+      if (payload.id !== undefined && store.has(payload.id)) {
+        return json({ error: 'already exists', id: payload.id }, { status: 409 });
+      }
       const id = payload.id ?? `item-${nextId++}`;
       const created = { ...payload, id } as Item;
       store.set(id, created);
