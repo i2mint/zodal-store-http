@@ -70,11 +70,11 @@ That is the whole pitch: `@zodal/store-http` is the *today* half of a migration 
 |---|---|
 | `getList(params)` | `GET {baseUrl}` (+ query, see below) |
 | `getOne(id)` | `GET {baseUrl}/{id}` |
-| `create(data)` | `POST {baseUrl}` |
+| `create(data)` | `POST {baseUrl}` (an existing id must be refused by the server, e.g. `409`; surfaces as `HttpError`) |
 | `update(id, data)` | `PATCH {baseUrl}/{id}` |
-| `updateMany(ids, data)` | N × `PATCH` |
+| `updateMany(ids, data)` | N × `PATCH`, in parallel; ids answered `404` are skipped, any other error rejects |
 | `delete(id)` | `DELETE {baseUrl}/{id}` |
-| `deleteMany(ids)` | N × `DELETE` |
+| `deleteMany(ids)` | N × `DELETE`, in parallel; ids answered `404` are skipped, any other error rejects |
 
 ```typescript
 const provider = createHttpProvider<Project>({
@@ -94,8 +94,8 @@ const { data, total } = await provider.getList({
 
 REST endpoints differ enormously in what they can do, so this provider assumes **nothing**:
 by default it fetches the collection and evaluates filter / search / sort / pagination
-**client-side** (filters via `filterToFunction()` from `@zodal/store` — the same evaluator
-the in-memory provider uses). `getCapabilities()` reports that honestly, so the UI layer is
+**client-side** (through `applyQuery()` from `@zodal/store` — the same evaluator the
+in-memory provider uses). `getCapabilities()` reports that honestly, so the UI layer is
 never lied to.
 
 Tell it what your server actually does, and it delegates exactly that much:

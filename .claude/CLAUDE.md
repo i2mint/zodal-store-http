@@ -21,6 +21,7 @@ tests/
   mock-backend.ts       # injected mock `fetch` -- a REST backend and a blob backend
   provider.test.ts
   blob-provider.test.ts
+  contract.test.ts      # @zodal/store/testing conformance kit, client-side / delegating / mixed
 ```
 
 ## Load-Bearing Invariants
@@ -40,19 +41,21 @@ Break any of these and the package stops being worth having:
    is the classic bug: the field silently holds a pending Promise and `ref.url` reads
    `undefined`.
 5. **Capabilities are reported honestly.** Anything not delegated to the server is done
-   client-side (filters via `filterToFunction()` from `@zodal/store` -- never
-   re-implemented here), and `getCapabilities()` says so.
+   client-side (through `applyQuery()` from `@zodal/store`, skipping the steps the server
+   did -- never re-implemented here), and `getCapabilities()` says so. When the server
+   paginates, `total` is the server's.
+7. **Contract errors come from the server's status.** `create` with an existing id must be
+   refused by the backend (409); `updateMany`/`deleteMany` skip ids answered 404 and
+   reject on any other error.
 6. **Nothing about the REST convention is hardcoded.** `toQuery` and `parseList` are the
    escape hatches; their defaults are documented in the README and in the option doc
    comments. Keep those three in sync.
 
 ## Version Situation (read before touching package.json)
 
-`peerDependencies` / `devDependencies` point at `@zodal/core` + `@zodal/store` **^0.2.0** --
-the version that carries the optional `getUrl?(id, field)` method on `DataProvider`. At the
-time of writing, npm has only **0.1.2**, which does not.
-
-So `pnpm install` from the registry will fail until 0.2.0 is published. To work locally,
+`peerDependencies` / `devDependencies` point at `@zodal/core` + `@zodal/store` **^0.2.1** --
+the version that carries `applyQuery` and the `@zodal/store/testing` conformance kit. If
+it is not on npm yet, `pnpm install` from the registry will fail until it is. To work locally,
 build the monorepo packages and link them into `node_modules` (do **not** commit `file:`
 deps -- CI has no sibling checkout):
 
@@ -66,9 +69,8 @@ ln -sfn ../../../zodal/packages/store node_modules/@zodal/store
 npx tsc --noEmit && npx vitest run
 ```
 
-No lockfile is committed yet, and CI installs with `--no-frozen-lockfile` for the same
-reason. Once `@zodal/core`/`@zodal/store` 0.2.0 are on npm: run `pnpm install`, commit
-`pnpm-lock.yaml`, and flip CI back to `--frozen-lockfile`.
+`pnpm-lock.yaml` is committed and CI installs with `--frozen-lockfile`, so after a peer
+bump the lockfile must be regenerated (`pnpm install`) once the new core version is on npm.
 
 ## Testing
 
