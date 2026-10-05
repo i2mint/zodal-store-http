@@ -38,6 +38,7 @@ import {
   withQuery,
   type FetchLike,
 } from './http.js';
+import { CLIENT_SIDE_DEFAULTS } from './capabilities.js';
 
 /** What a list endpoint may hand back, before `parseList` normalizes it. */
 type ListPayload<T> = T[] | { data: T[]; total?: number };
@@ -103,21 +104,6 @@ export interface HttpProviderOptions<T> {
    */
   capabilities?: Partial<ProviderCapabilities>;
 }
-
-const CLIENT_SIDE_DEFAULTS: ProviderCapabilities = {
-  canCreate: true,
-  canUpdate: true,
-  canDelete: true,
-  // `updateMany`/`deleteMany` are N requests, not a bulk endpoint — but they work,
-  // so the UI is right to offer bulk actions.
-  canBulkUpdate: true,
-  canBulkDelete: true,
-  canUpsert: false,
-  serverSort: false,
-  serverFilter: false,
-  serverSearch: false,
-  serverPagination: false,
-};
 
 /** Collect every field named anywhere in a (possibly compound) filter expression. */
 function _filterFields(filter: FilterExpression, into: Set<string> = new Set()): Set<string> {

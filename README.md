@@ -16,7 +16,7 @@ do).
 ## Install
 
 ```bash
-npm install @zodal/store-http @zodal/core @zodal/store
+npm install @zodal/store-http @zodal/core @zodal/store zod
 ```
 
 ## The point: today's backend, tomorrow's bucket
@@ -231,6 +231,28 @@ name a URL for its own bytes. That is the point of this adapter.
 | `urlFor` | `(id, field) => string \| Promise<string>` | — | Full control; may presign |
 | `writeMethod` | `'PUT' \| 'POST'` | `'PUT'` | How content is written |
 | `contentTypeFor` | `(id, field, content) => string \| undefined` | inferred | Override the write `Content-Type` |
+
+## Use from a menu
+
+Both providers are also exported as descriptors (`@zodal/store` ≥ 0.2.2): name, runtime, options as a Zod schema, capabilities and a `supports()` check, so an app, a playground or an agent can list them and create one by name. `create` loads the provider module only when called.
+
+```typescript
+import { createFromDescriptor, redactOptions } from '@zodal/store/descriptor';
+import { descriptor, blobDescriptor } from '@zodal/store-http'; // 'http', 'httpBlob'; runtime 'any'
+
+const options = {
+  baseUrl: '/api/projects',
+  init: { credentials: 'include', headers: { Authorization: `Bearer ${token}` } },
+  capabilities: { serverFilter: ['status'], serverSort: true },
+};
+const provider = await createFromDescriptor(descriptor, options);
+redactOptions(descriptor, options); // headers → '[secret]'; credentials: 'include' stays
+```
+
+- `init.headers` is a secret as a whole (it carries `Authorization`); `init.credentials` is a fetch mode and stays visible. Headers are plain data here (an object or `[name, value]` pairs); pass a `Headers` instance to the factory directly.
+- `fetch`, `toQuery`, `parseList`, `urlFor`, `contentTypeFor` and `init.signal` are live options: supplied in code, never shared or exported.
+- The menu's capabilities come from the `capabilities` option, exactly as `getCapabilities()` reports them.
+- `supports()` checks for a global `fetch`; elsewhere, pass `fetch` and create the provider directly.
 
 ## Errors
 

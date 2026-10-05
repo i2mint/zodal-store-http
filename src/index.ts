@@ -16,3 +16,6 @@ export type { HttpBlobProviderOptions } from './blob-provider.js';
 // HTTP plumbing (injectable fetch, informative errors)
 export { HttpError } from './http.js';
 export type { FetchLike } from './http.js';
+
+// Provider descriptors (a backend menu: list, configure, check, create by name)
+export { descriptor, blobDescriptor } from './descriptor.js';

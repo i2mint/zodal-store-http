@@ -17,11 +17,14 @@ src/
   http.ts            # shared plumbing: FetchLike, HttpError, joinUrl, request/response helpers
   provider.ts        # createHttpProvider  (GET/POST/PATCH/DELETE + client-side fallback)
   blob-provider.ts   # createHttpBlobProvider (getUrl / getContent / setContent)
+  capabilities.ts    # CLIENT_SIDE_DEFAULTS (shared by the provider and its descriptor)
+  descriptor.ts      # provider descriptors: descriptor (http), blobDescriptor (httpBlob)
 tests/
   mock-backend.ts       # injected mock `fetch` -- a REST backend and a blob backend
   provider.test.ts
   blob-provider.test.ts
   contract.test.ts      # @zodal/store/testing conformance kit, client-side / delegating / mixed
+  descriptor.test.ts    # the kit through createFromDescriptor; secret headers, live options, capabilities
 ```
 
 ## Load-Bearing Invariants
@@ -50,11 +53,17 @@ Break any of these and the package stops being worth having:
 6. **Nothing about the REST convention is hardcoded.** `toQuery` and `parseList` are the
    escape hatches; their defaults are documented in the README and in the option doc
    comments. Keep those three in sync.
+8. **The descriptors' options schemas declare every factory option** (validation strips
+   undeclared keys; `init` alone is `.loose()`, passed to `fetch` as given). `init.headers`
+   is secret as a whole; `init.credentials` is declared public (a mode, not a credential);
+   functions and `init.signal` are `z.custom()` (live). A new factory option must be added
+   to `src/descriptor.ts` too.
 
 ## Version Situation (read before touching package.json)
 
-`peerDependencies` / `devDependencies` point at `@zodal/core` + `@zodal/store` **^0.2.1** --
-the version that carries `applyQuery` and the `@zodal/store/testing` conformance kit. If
+`peerDependencies` / `devDependencies` point at `@zodal/core` + `@zodal/store` **^0.2.2** --
+the version that carries `applyQuery`, the `@zodal/store/testing` conformance kit and the
+`@zodal/store/descriptor` subpath. `zod` (^4) is a peer: the descriptors import it. If
 it is not on npm yet, `pnpm install` from the registry will fail until it is. To work locally,
 build the monorepo packages and link them into `node_modules` (do **not** commit `file:`
 deps -- CI has no sibling checkout):
@@ -66,6 +75,7 @@ cd ../../../zodal-store-http
 mkdir -p node_modules/@zodal
 ln -sfn ../../../zodal/packages/core  node_modules/@zodal/core
 ln -sfn ../../../zodal/packages/store node_modules/@zodal/store
+ln -sfn ../../zodal/node_modules/.pnpm/zod@4.3.6/node_modules/zod node_modules/zod  # the monorepo's zod: one copy
 npx tsc --noEmit && npx vitest run
 ```
 
@@ -93,6 +103,7 @@ result and the absence of the corresponding query param. Keep them non-vacuous t
 
 - `@zodal/core` -- types (`FilterExpression`, `SortingState`, `ContentRef`)
 - `@zodal/store` -- `DataProvider`, `ProviderCapabilities`, `filterToFunction`
-- No runtime dependencies. `fetch` is injected (default `globalThis.fetch`), so the package
+- `zod` (peer) -- the descriptors' options schemas
+- No other runtime dependency. `fetch` is injected (default `globalThis.fetch`), so the package
   runs in browsers, Node >= 18, Deno, Bun and workers alike. `tsconfig` targets
   `["ES2022", "DOM"]` with `"types": []` -- deliberately no `@types/node`.
