@@ -16,7 +16,7 @@ do).
 ## Install
 
 ```bash
-npm install @zodal/store-http @zodal/core @zodal/store
+npm install @zodal/store-http @zodal/core @zodal/store zod
 ```
 
 ## The point: today's backend, tomorrow's bucket
@@ -270,6 +270,29 @@ await images.headContent('sg_3f2a.svg', 'image'); // HEAD: { url, mimeType, size
 ```
 
 The upload request carries only the headers `uploadUrlFor` returns (plus `Content-Type`), never `init`'s auth headers or cookies, and goes through `uploadFetch` (default `globalThis.fetch`), not your `fetch` wrapper. `uploadUrlFor` needs `urlFor` or `publicBaseUrl` so reads find the bytes. `validateContent` spares the user a failed upload; the server must still validate what it accepts. With `conditionalWrites: true` (the target honours `If-None-Match`, as S3/R2/GCS presigned PUTs do) `ifAbsent` is atomic and a 412/409 means "already stored"; by default it also checks with a HEAD first and is reported as `best-effort`. Ids of `.`, `..` or empty are refused: they cannot name an item in a URL path.
+
+## Use from a menu
+
+Both providers are also exported as descriptors (`@zodal/store` ≥ 0.2.2): name, runtime, options as a Zod schema, capabilities and a `supports()` check, so an app, a playground or an agent can list them and create one by name. `create` loads the provider module only when called.
+
+```typescript
+import { createFromDescriptor, redactOptions } from '@zodal/store/descriptor';
+import { descriptor, blobDescriptor } from '@zodal/store-http'; // 'http', 'httpBlob'; runtime 'any'
+
+const options = {
+  baseUrl: '/api/projects',
+  init: { credentials: 'include', headers: { Authorization: `Bearer ${token}` } },
+  capabilities: { serverFilter: ['status'], serverSort: true },
+};
+const provider = await createFromDescriptor(descriptor, options);
+redactOptions(descriptor, options); // headers → '[secret]'; credentials: 'include' stays
+```
+
+- `init.headers` is a secret as a whole (it carries `Authorization`); `init.credentials` is a fetch mode and stays visible. Headers are plain data here (an object or `[name, value]` pairs); pass a `Headers` instance to the factory directly.
+- `fetch`, `toQuery`, `parseList`, `urlFor`, `contentTypeFor`, `uploadUrlFor`, `validateContent`, `uploadFetch` and `init.signal` are live options: supplied in code, never shared or exported.
+- `versioned` (http) and `conditionalWrites` (httpBlob) are plain data and show in the menu's capabilities (`versioned: true`; `contentIfAbsent: 'atomic'` vs `'best-effort'`).
+- The menu's capabilities come from the `capabilities` option, exactly as `getCapabilities()` reports them.
+- `supports()` checks for a global `fetch`; elsewhere, pass `fetch` and create the provider directly.
 
 ## Errors
 

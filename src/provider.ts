@@ -30,7 +30,6 @@ import type {
 } from '@zodal/store';
 import { applyQuery, type ApplyQueryOptions } from '@zodal/store';
 import {
-  HttpError,
   httpRequest,
   joinUrl,
   readJson,
@@ -39,6 +38,7 @@ import {
   withQuery,
   type FetchLike,
 } from './http.js';
+import { CLIENT_SIDE_DEFAULTS } from './capabilities.js';
 
 /** What a list endpoint may hand back, before `parseList` normalizes it. */
 type ListPayload<T> = T[] | { data: T[]; total?: number };
@@ -111,21 +111,6 @@ export interface HttpProviderOptions<T> {
    */
   capabilities?: Partial<ProviderCapabilities>;
 }
-
-const CLIENT_SIDE_DEFAULTS: ProviderCapabilities = {
-  canCreate: true,
-  canUpdate: true,
-  canDelete: true,
-  // `updateMany`/`deleteMany` are N requests, not a bulk endpoint — but they work,
-  // so the UI is right to offer bulk actions.
-  canBulkUpdate: true,
-  canBulkDelete: true,
-  canUpsert: false,
-  serverSort: false,
-  serverFilter: false,
-  serverSearch: false,
-  serverPagination: false,
-};
 
 /** Collect every field named anywhere in a (possibly compound) filter expression. */
 function _filterFields(filter: FilterExpression, into: Set<string> = new Set()): Set<string> {
@@ -375,6 +360,10 @@ export function createHttpProvider<T extends Record<string, any>>(
     },
 
     async create(data: Partial<T>): Promise<T> {
+      // A client-chosen id that no item URL can name ('.', '..', '') is refused up front:
+      // stored, it could never be read, updated or deleted again (zodal#131).
+      const givenId = (data as Record<string, unknown>)[idField];
+      if (givenId !== undefined && givenId !== null) itemUrl(String(givenId));
       const response = await httpRequest(doFetch, {
         method: 'POST',
         url: baseUrl,
