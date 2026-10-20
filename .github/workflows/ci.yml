@@ -221,14 +221,6 @@ jobs:
           echo "::error::@zodal/store-http@${VERSION} never appeared on the registry — the publish failed."
           exit 1
 
-      - name: Configure SSH for git push
-        run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan github.com >> ~/.ssh/known_hosts
-          git remote set-url origin git@github.com:${{ github.repository }}.git
-
       # Tag the published version. An existing remote tag is fine (a re-run, or a version that
       # was already on npm and tagged by the run that published it); any other push failure
       # (key, permissions, network) fails the run instead of leaving a version with no tag.
