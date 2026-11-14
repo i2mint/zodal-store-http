@@ -44,6 +44,7 @@ import type {
   ProviderCapabilities,
 } from '@zodal/store';
 import {
+  HttpError,
   httpRequest,
   joinUrl,
   resolveFetch,
@@ -86,12 +87,89 @@ export interface HttpBlobProviderOptions {
    * `contentTypeFor: (id) => (id.endsWith('.mp4') ? 'video/mp4' : undefined)`.
    */
   contentTypeFor?: (id: string, field: string, content: unknown) => string | undefined;
+  /**
+   * Upload somewhere other than `baseUrl`, without the browser holding storage credentials:
+   * your backend mints a short-lived URL (an S3/R2/GCS presigned PUT) and this provider sends
+   * the bytes there. Called once per write with the content's MIME type and size. The request
+   * carries only the headers returned here (plus `Content-Type`), never `init`'s headers or
+   * cookies, which belong to your backend. Reads still follow `urlFor`/`publicBaseUrl`; deletes
+   * still go to `baseUrl`.
+   */
+  uploadUrlFor?: (
+    id: string,
+    field: string,
+    info: { mimeType: string; size?: number },
+  ) => Promise<UploadTarget> | UploadTarget;
+  /**
+   * Check content before any upload (size and type limits); throw to refuse the write.
+   * A convenience for the user, not a defence: the server must validate what it accepts.
+   */
+  validateContent?: (content: unknown, info: { id: string; field: string; mimeType: string; size?: number }) => void | Promise<void>;
+  /**
+   * The `fetch` used for `uploadUrlFor` uploads. Default: `globalThis.fetch`, deliberately not the
+   * `fetch` option: a wrapper that adds your backend's `Authorization` must not send it to the
+   * storage host (S3 also rejects a request carrying two auth mechanisms).
+   */
+  uploadFetch?: FetchLike;
+  /**
+   * Whether the write target honours `If-None-Match: *` (S3, R2 and GCS presigned PUTs do; a
+   * plain REST backend may not). `true` makes `ifAbsent` atomic and reports
+   * `contentIfAbsent: 'atomic'`; the default `false` also checks with a HEAD first and reports
+   * `'best-effort'`, since a backend that ignores the header would overwrite.
+   */
+  conditionalWrites?: boolean;
+}
+
+/** Where one upload goes (from `uploadUrlFor`). */
+export interface UploadTarget {
+  url: string;
+  /** Default: the provider's `writeMethod`. */
+  method?: 'PUT' | 'POST';
+  /** Headers the presigned URL requires (they are part of its signature). */
+  headers?: Record<string, string>;
+}
+
+/**
+ * Per-write options; the same shape as `ContentWriteInit` in `@zodal/store` (i2mint/zodal#129),
+ * declared here so this package works with `@zodal/store` 0.2.0.
+ */
+export interface ContentWriteOptions {
+  /** The content's MIME type; wins over `contentTypeFor` and the inferred type. */
+  mimeType?: string;
+  /** Sent as `Cache-Control` on the write (a presigned URL must have signed it). */
+  cacheControl?: string;
+  /**
+   * Write only when nothing is stored: sent as `If-None-Match: *`; a 412 answer means the
+   * content already exists, and the existing content's reference is returned. The server (or
+   * storage) must honour `If-None-Match`; S3 and R2 do for PUT.
+   */
+  ifAbsent?: boolean;
+  /** Recorded on the returned reference. */
+  hash?: string;
+}
+
+function sizeOf(content: unknown): number | undefined {
+  if (content instanceof Uint8Array) return content.byteLength;
+  if (content instanceof ArrayBuffer) return content.byteLength;
+  if (typeof Blob !== 'undefined' && content instanceof Blob) return content.size;
+  if (typeof content === 'string') return new TextEncoder().encode(content).byteLength;
+  return undefined;
 }
 
 export function createHttpBlobProvider<T extends Record<string, any>>(
   options: HttpBlobProviderOptions,
-): DataProvider<T> {
-  const { baseUrl, contentFields, init, publicBaseUrl, urlFor, contentTypeFor } = options;
+): DataProvider<T> & {
+  setContent(id: string, field: string, content: unknown, opts?: ContentWriteOptions): Promise<ContentRef>;
+  headContent(id: string, field: string): Promise<ContentRef | null>;
+} {
+  const { baseUrl, contentFields, init, publicBaseUrl, urlFor, contentTypeFor, uploadUrlFor, validateContent } = options;
+  const conditionalWrites = options.conditionalWrites ?? false;
+  const uploadFetch = resolveFetch(options.uploadFetch);
+  if (uploadUrlFor && !urlFor && !publicBaseUrl) {
+    throw new Error(
+      'createHttpBlobProvider: uploadUrlFor sends the bytes somewhere other than baseUrl, so reads need urlFor or publicBaseUrl to find them',
+    );
+  }
   const idField = options.idField ?? 'id';
   const writeMethod = options.writeMethod ?? 'PUT';
   const doFetch = resolveFetch(options.fetch);
@@ -132,24 +210,71 @@ export function createHttpBlobProvider<T extends Record<string, any>>(
     return joinUrl(baseUrl, ...contentSegments(id, field));
   }
 
-  async function putBlob(id: string, field: string, content: unknown): Promise<ContentRef> {
+  async function putBlob(id: string, field: string, content: unknown, opts: ContentWriteOptions = {}): Promise<ContentRef> {
     const { body, contentType } = toRequestBody(content);
-    const mimeType = contentTypeFor?.(id, field, content) ?? contentType;
-    await httpRequest(doFetch, {
-      method: writeMethod,
-      url: writeUrl(id, field),
-      init,
-      body,
-      headers: { 'Content-Type': mimeType },
-    });
+    const mimeType = opts.mimeType ?? contentTypeFor?.(id, field, content) ?? contentType;
+    const size = sizeOf(content);
+    await validateContent?.(content, { id, field, mimeType, ...(size !== undefined ? { size } : {}) });
+    const headers: Record<string, string> = { 'Content-Type': mimeType };
+    if (opts.cacheControl) headers['Cache-Control'] = opts.cacheControl;
+    if (opts.ifAbsent) {
+      headers['If-None-Match'] = '*';
+      if (!conditionalWrites) {
+        // The target may ignore If-None-Match: look first (a race remains: best-effort).
+        const existing = await headBlob(id, field);
+        if (existing) return existing;
+      }
+    }
+    try {
+      if (uploadUrlFor) {
+        const target = await uploadUrlFor(id, field, { mimeType, ...(size !== undefined ? { size } : {}) });
+        await httpRequest(uploadFetch, {
+          method: target.method ?? writeMethod,
+          url: target.url,
+          // Not `init`: its auth headers and cookies are for your backend, not for storage.
+          init: init?.signal ? { signal: init.signal } : undefined,
+          body,
+          headers: { ...headers, ...target.headers },
+        });
+      } else {
+        await httpRequest(doFetch, { method: writeMethod, url: writeUrl(id, field), init, body, headers });
+      }
+    } catch (err) {
+      // 412: the precondition failed, so content is there. 409: S3's ConditionalRequestConflict,
+      // a concurrent conditional write of the same key won. Either way: already stored. No HEAD
+      // here (a presigned GET answers HEAD with 403), so the reference carries only the URL.
+      if (opts.ifAbsent && err instanceof HttpError && (err.status === 412 || err.status === 409)) {
+        return { _tag: 'ContentRef', field, itemId: id, url: await readUrl(id, field) };
+      }
+      throw err;
+    }
     return {
       _tag: 'ContentRef',
       field,
       itemId: id,
       url: await readUrl(id, field),
       mimeType,
-      ...(content instanceof Uint8Array ? { size: content.byteLength } : {}),
+      ...(size !== undefined ? { size } : {}),
+      ...(opts.hash !== undefined ? { hash: opts.hash } : {}),
     };
+  }
+
+  /** Is content stored, and where? A HEAD on the read URL; `null` on 404/410. */
+  async function headBlob(id: string, field: string): Promise<ContentRef | null> {
+    const url = await readUrl(id, field);
+    let response: Response;
+    try {
+      response = await httpRequest(doFetch, { method: 'HEAD', url, init });
+    } catch (err) {
+      if (err instanceof HttpError && (err.status === 404 || err.status === 410)) return null;
+      throw err;
+    }
+    const ref: ContentRef = { _tag: 'ContentRef', field, itemId: id, url };
+    const type = response.headers.get('Content-Type');
+    if (type) ref.mimeType = type;
+    const length = response.headers.get('Content-Length');
+    if (length !== null && /^\d+$/.test(length)) ref.size = Number(length);
+    return ref;
   }
 
   async function getBlob(id: string, field: string): Promise<Uint8Array> {
@@ -239,6 +364,8 @@ export function createHttpBlobProvider<T extends Record<string, any>>(
         serverPagination: false,
         bifurcated: false,
         contentFields: [...contentFields],
+        // Honoured through If-None-Match: * (the server or storage must support it).
+        ...({ contentIfAbsent: conditionalWrites ? 'atomic' : 'best-effort' } as Partial<ProviderCapabilities>),
       };
     },
 
@@ -263,9 +390,15 @@ export function createHttpBlobProvider<T extends Record<string, any>>(
       return getBlob(id, field);
     },
 
-    async setContent(id: string, field: string, content: unknown): Promise<ContentRef> {
+    async setContent(id: string, field: string, content: unknown, opts?: ContentWriteOptions): Promise<ContentRef> {
       assertContentField(field);
-      return putBlob(id, field, content);
+      return putBlob(id, field, content, opts);
+    },
+
+    /** Is content stored for this field, and where? A HEAD request, no bytes transferred. */
+    async headContent(id: string, field: string): Promise<ContentRef | null> {
+      assertContentField(field);
+      return headBlob(id, field);
     },
   };
 }
