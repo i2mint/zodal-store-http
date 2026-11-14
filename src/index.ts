@@ -6,8 +6,8 @@
  */
 
 // Full REST CRUD provider
-export { createHttpProvider } from './provider.js';
-export type { HttpProviderOptions } from './provider.js';
+export { createHttpProvider, WriteConflictError } from './provider.js';
+export type { HttpProviderOptions, HttpVersionedMethods } from './provider.js';
 
 // Blob-only provider: content addressed by URL, for bifurcation or standalone use
 export { createHttpBlobProvider } from './blob-provider.js';
