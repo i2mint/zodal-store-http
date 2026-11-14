@@ -33,6 +33,7 @@ import {
   httpRequest,
   joinUrl,
   readJson,
+  HttpError,
   resolveFetch,
   withQuery,
   type FetchLike,
@@ -58,6 +59,13 @@ export interface HttpProviderOptions<T> {
   init?: RequestInit;
   /** Fields to include in the client-side text-search fallback. Default: all string-valued fields. */
   searchFields?: string[];
+  /**
+   * The backend versions items with HTTP `ETag`s and honours `If-Match` (answering 412 when it
+   * does not match): turns on `getVersioned` / `updateIfVersion` / `deleteIfVersion` and reports
+   * `capabilities.versioned` (i2mint/zodal#118). Default: false, since a backend that ignores
+   * `If-Match` would make every conditional write silently last-write-wins.
+   */
+  versioned?: boolean;
   /**
    * Encode the `getList` params the server has been declared capable of handling
    * (see `capabilities`) as a query string.
@@ -197,6 +205,36 @@ function _sortItems<T>(items: T[], sort: SortingState[]): T[] {
   });
 }
 
+/**
+ * A conditional write lost (i2mint/zodal#118). Named `WriteConflict`, so `isWriteConflict` from
+ * `@zodal/store` matches it; declared here because the `@zodal/store` on npm predates it.
+ */
+export class WriteConflictError extends Error {
+  override name = 'WriteConflict';
+  constructor(
+    readonly id: string,
+    readonly expected: string | number,
+    /** The current version when the server said it, `undefined` when unknown or the item is gone. */
+    readonly actual: string | number | undefined,
+  ) {
+    super(
+      `Write conflict on ${JSON.stringify(id)}: version ${JSON.stringify(expected)} is no longer current` +
+        (actual === undefined ? '' : ` (now ${JSON.stringify(actual)})`),
+    );
+  }
+}
+
+/** The versioned methods `createHttpProvider({ versioned: true })` adds. */
+export interface HttpVersionedMethods<T> {
+  getVersioned(id: string): Promise<{ item: T; version: string }>;
+  updateIfVersion(id: string, data: Partial<T>, expected: string | number): Promise<{ item: T; version: string }>;
+  deleteIfVersion(id: string, expected: string | number): Promise<void>;
+}
+
+export function createHttpProvider<T extends Record<string, any>>(
+  options: HttpProviderOptions<T> & { versioned: true },
+): DataProvider<T> & HttpVersionedMethods<T>;
+export function createHttpProvider<T extends Record<string, any>>(options: HttpProviderOptions<T>): DataProvider<T>;
 export function createHttpProvider<T extends Record<string, any>>(
   options: HttpProviderOptions<T>,
 ): DataProvider<T> {
@@ -274,7 +312,59 @@ export function createHttpProvider<T extends Record<string, any>>(
     await httpRequest(doFetch, { method: 'DELETE', url: itemUrl(id), init });
   }
 
+  /** The ETag a response carries; a versioned read without one is an error, not a guess. */
+  function etagOf(response: Response, what: string): string {
+    const etag = response.headers.get('ETag');
+    if (!etag) throw new Error(`${what} returned no ETag; createHttpProvider({ versioned: true }) needs the backend to send one`);
+    return etag;
+  }
+
+  /** 412 (If-Match failed) and 404/410 (gone) are a lost race; anything else is an error. */
+  function conflictOr(err: unknown, id: string, expected: string | number): never {
+    if (err instanceof HttpError && (err.status === 412 || err.status === 404 || err.status === 410)) {
+      throw new WriteConflictError(id, expected, undefined);
+    }
+    throw err;
+  }
+
+  const versionedMethods: HttpVersionedMethods<T> = {
+    async getVersioned(id) {
+      const response = await httpRequest(doFetch, { method: 'GET', url: itemUrl(id), init });
+      const version = etagOf(response, `GET ${itemUrl(id)}`);
+      const item = await readJson<T>(response);
+      if (item === undefined) throw new Error(`GET ${itemUrl(id)} returned an empty body; expected the item.`);
+      return { item, version };
+    },
+    async updateIfVersion(id, data, expected) {
+      let response: Response;
+      try {
+        response = await httpRequest(doFetch, {
+          method: 'PATCH',
+          url: itemUrl(id),
+          init,
+          body: JSON.stringify(data),
+          headers: { ...jsonHeaders, 'If-Match': String(expected) },
+        });
+      } catch (err) {
+        conflictOr(err, id, expected);
+      }
+      const item = await readJson<T>(response);
+      const etag = response.headers.get('ETag');
+      // Without the new item or ETag in the answer, read them back (one GET).
+      if (item === undefined || !etag) return versionedMethods.getVersioned(id);
+      return { item, version: etag };
+    },
+    async deleteIfVersion(id, expected) {
+      try {
+        await httpRequest(doFetch, { method: 'DELETE', url: itemUrl(id), init, headers: { 'If-Match': String(expected) } });
+      } catch (err) {
+        conflictOr(err, id, expected);
+      }
+    },
+  };
+
   return {
+    ...(options.versioned ? versionedMethods : {}),
     async getList(params: GetListParams): Promise<GetListResult<T>> {
       const { delegated, local } = planQuery(params);
       const url = withQuery(baseUrl, toQuery(delegated));
@@ -336,7 +426,8 @@ export function createHttpProvider<T extends Record<string, any>>(
     },
 
     getCapabilities(): ProviderCapabilities {
-      return { ...capabilities };
+      // `versioned` is declared structurally: the @zodal/store on npm predates the field.
+      return options.versioned ? ({ ...capabilities, versioned: true } as ProviderCapabilities) : { ...capabilities };
     },
   };
 }

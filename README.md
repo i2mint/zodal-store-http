@@ -176,6 +176,18 @@ createHttpProvider({
 | `parseList` | `(response) => {data,total}` | see above | List-response normalization |
 | `capabilities` | `Partial<ProviderCapabilities>` | all-client-side | What the server really does |
 
+### Conditional writes (ETag / If-Match)
+
+For a record several clients write (a lock, a shared document), turn on `versioned` when the backend sends `ETag`s and honours `If-Match`:
+
+```ts
+const docs = createHttpProvider({ baseUrl: '/api/docs', versioned: true });
+const { item, version } = await docs.getVersioned('plan');   // version = the ETag
+await docs.updateIfVersion('plan', { lock: 'me' }, version);  // PATCH with If-Match; 412 → WriteConflictError
+```
+
+A 412 (or a 404/410: the item is gone) rejects with `WriteConflictError` (named `WriteConflict`, so `isWriteConflict` from `@zodal/store` matches it), and nothing is written. Off by default: a backend that ignored `If-Match` would make every conditional write silently last-write-wins, so the capability is declared only when you say the backend supports it.
+
 ## `createHttpBlobProvider` — content, addressed by URL
 
 Content-only. Pair it as the `contentProvider` of `createBifurcatedProvider` (above), or
