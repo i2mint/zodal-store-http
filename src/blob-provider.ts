@@ -105,6 +105,19 @@ export interface HttpBlobProviderOptions {
    * A convenience for the user, not a defence: the server must validate what it accepts.
    */
   validateContent?: (content: unknown, info: { id: string; field: string; mimeType: string; size?: number }) => void | Promise<void>;
+  /**
+   * The `fetch` used for `uploadUrlFor` uploads. Default: `globalThis.fetch`, deliberately not the
+   * `fetch` option: a wrapper that adds your backend's `Authorization` must not send it to the
+   * storage host (S3 also rejects a request carrying two auth mechanisms).
+   */
+  uploadFetch?: FetchLike;
+  /**
+   * Whether the write target honours `If-None-Match: *` (S3, R2 and GCS presigned PUTs do; a
+   * plain REST backend may not). `true` makes `ifAbsent` atomic and reports
+   * `contentIfAbsent: 'atomic'`; the default `false` also checks with a HEAD first and reports
+   * `'best-effort'`, since a backend that ignores the header would overwrite.
+   */
+  conditionalWrites?: boolean;
 }
 
 /** Where one upload goes (from `uploadUrlFor`). */
@@ -150,6 +163,13 @@ export function createHttpBlobProvider<T extends Record<string, any>>(
   headContent(id: string, field: string): Promise<ContentRef | null>;
 } {
   const { baseUrl, contentFields, init, publicBaseUrl, urlFor, contentTypeFor, uploadUrlFor, validateContent } = options;
+  const conditionalWrites = options.conditionalWrites ?? false;
+  const uploadFetch = resolveFetch(options.uploadFetch);
+  if (uploadUrlFor && !urlFor && !publicBaseUrl) {
+    throw new Error(
+      'createHttpBlobProvider: uploadUrlFor sends the bytes somewhere other than baseUrl, so reads need urlFor or publicBaseUrl to find them',
+    );
+  }
   const idField = options.idField ?? 'id';
   const writeMethod = options.writeMethod ?? 'PUT';
   const doFetch = resolveFetch(options.fetch);
@@ -197,11 +217,18 @@ export function createHttpBlobProvider<T extends Record<string, any>>(
     await validateContent?.(content, { id, field, mimeType, ...(size !== undefined ? { size } : {}) });
     const headers: Record<string, string> = { 'Content-Type': mimeType };
     if (opts.cacheControl) headers['Cache-Control'] = opts.cacheControl;
-    if (opts.ifAbsent) headers['If-None-Match'] = '*';
+    if (opts.ifAbsent) {
+      headers['If-None-Match'] = '*';
+      if (!conditionalWrites) {
+        // The target may ignore If-None-Match: look first (a race remains: best-effort).
+        const existing = await headBlob(id, field);
+        if (existing) return existing;
+      }
+    }
     try {
       if (uploadUrlFor) {
         const target = await uploadUrlFor(id, field, { mimeType, ...(size !== undefined ? { size } : {}) });
-        await httpRequest(doFetch, {
+        await httpRequest(uploadFetch, {
           method: target.method ?? writeMethod,
           url: target.url,
           // Not `init`: its auth headers and cookies are for your backend, not for storage.
@@ -213,9 +240,11 @@ export function createHttpBlobProvider<T extends Record<string, any>>(
         await httpRequest(doFetch, { method: writeMethod, url: writeUrl(id, field), init, body, headers });
       }
     } catch (err) {
-      if (opts.ifAbsent && err instanceof HttpError && err.status === 412) {
-        const existing = await headBlob(id, field);
-        if (existing) return existing;
+      // 412: the precondition failed, so content is there. 409: S3's ConditionalRequestConflict,
+      // a concurrent conditional write of the same key won. Either way: already stored. No HEAD
+      // here (a presigned GET answers HEAD with 403), so the reference carries only the URL.
+      if (opts.ifAbsent && err instanceof HttpError && (err.status === 412 || err.status === 409)) {
+        return { _tag: 'ContentRef', field, itemId: id, url: await readUrl(id, field) };
       }
       throw err;
     }
@@ -245,8 +274,6 @@ export function createHttpBlobProvider<T extends Record<string, any>>(
     if (type) ref.mimeType = type;
     const length = response.headers.get('Content-Length');
     if (length !== null && /^\d+$/.test(length)) ref.size = Number(length);
-    const etag = response.headers.get('ETag');
-    if (etag) ref.hash = etag;
     return ref;
   }
 
@@ -338,7 +365,7 @@ export function createHttpBlobProvider<T extends Record<string, any>>(
         bifurcated: false,
         contentFields: [...contentFields],
         // Honoured through If-None-Match: * (the server or storage must support it).
-        ...({ contentIfAbsent: 'atomic' } as Partial<ProviderCapabilities>),
+        ...({ contentIfAbsent: conditionalWrites ? 'atomic' : 'best-effort' } as Partial<ProviderCapabilities>),
       };
     },
 

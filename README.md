@@ -257,7 +257,7 @@ await images.setContent('sg_3f2a.svg', 'image', svg, {
 await images.headContent('sg_3f2a.svg', 'image'); // HEAD: { url, mimeType, size } or null, no bytes
 ```
 
-The upload request carries only the headers `uploadUrlFor` returns (plus `Content-Type`), never `init`'s auth headers or cookies. `validateContent` spares the user a failed upload; the server must still validate what it accepts. `ifAbsent` needs a backend or storage that honours `If-None-Match` (S3 and R2 do for PUT). Ids of `.`, `..` or empty are refused: they cannot name an item in a URL path.
+The upload request carries only the headers `uploadUrlFor` returns (plus `Content-Type`), never `init`'s auth headers or cookies, and goes through `uploadFetch` (default `globalThis.fetch`), not your `fetch` wrapper. `uploadUrlFor` needs `urlFor` or `publicBaseUrl` so reads find the bytes. `validateContent` spares the user a failed upload; the server must still validate what it accepts. With `conditionalWrites: true` (the target honours `If-None-Match`, as S3/R2/GCS presigned PUTs do) `ifAbsent` is atomic and a 412/409 means "already stored"; by default it also checks with a HEAD first and is reported as `best-effort`. Ids of `.`, `..` or empty are refused: they cannot name an item in a URL path.
 
 ## Errors
 
