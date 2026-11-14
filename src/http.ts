@@ -79,6 +79,13 @@ export function resolveFetch(injected?: FetchLike): FetchLike {
  * `<video src>` when the backend serving the bytes is the same origin as the app.
  */
 export function joinUrl(base: string, ...segments: string[]): string {
+  // `.` and `..` survive percent-encoding (and `%2E%2E` is a dot segment to the URL parser),
+  // so `/items/..` would address the parent: refuse them rather than build that URL.
+  for (const s of segments) {
+    if (s === '.' || s === '..' || s === '') {
+      throw new Error(`joinUrl: ${JSON.stringify(s)} cannot be a URL path segment (it would not name an item)`);
+    }
+  }
   const trimmed = base.replace(/\/+$/, '');
   if (segments.length === 0) return trimmed;
   const path = segments.map((s) => encodeURIComponent(s)).join('/');

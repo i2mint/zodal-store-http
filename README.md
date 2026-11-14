@@ -232,6 +232,33 @@ name a URL for its own bytes. That is the point of this adapter.
 | `writeMethod` | `'PUT' \| 'POST'` | `'PUT'` | How content is written |
 | `contentTypeFor` | `(id, field, content) => string \| undefined` | inferred | Override the write `Content-Type` |
 
+### Uploading without storage credentials, and write options
+
+A browser should not hold bucket credentials. Have your backend mint a short-lived upload URL, and check limits before any byte leaves:
+
+```ts
+const images = createHttpBlobProvider({
+  baseUrl: '/api/images',                       // deletes, and reads unless redirected
+  publicBaseUrl: 'https://cdn.example.com',     // reads
+  contentFields: ['image'],
+  uploadUrlFor: (id, field, { mimeType, size }) =>
+    fetch(`/api/images/${id}/upload-url?type=${mimeType}&size=${size}`).then((r) => r.json()), // { url, method?, headers? }
+  validateContent: (_content, { mimeType, size }) => {
+    if (!mimeType.startsWith('image/')) throw new Error('images only');
+    if ((size ?? 0) > 2_000_000) throw new Error('2 MB at most');
+  },
+});
+
+await images.setContent('sg_3f2a.svg', 'image', svg, {
+  mimeType: 'image/svg+xml',
+  cacheControl: 'public, max-age=31536000, immutable',
+  ifAbsent: true,                               // If-None-Match: *; a 412 returns the stored ref
+});
+await images.headContent('sg_3f2a.svg', 'image'); // HEAD: { url, mimeType, size } or null, no bytes
+```
+
+The upload request carries only the headers `uploadUrlFor` returns (plus `Content-Type`), never `init`'s auth headers or cookies. `validateContent` spares the user a failed upload; the server must still validate what it accepts. `ifAbsent` needs a backend or storage that honours `If-None-Match` (S3 and R2 do for PUT). Ids of `.`, `..` or empty are refused: they cannot name an item in a URL path.
+
 ## Errors
 
 Any non-2xx throws an `HttpError` carrying `status`, `statusText`, `method`, `url` and the

@@ -187,6 +187,7 @@ async function bodyToBytes(body: BodyInit | null | undefined): Promise<Uint8Arra
 
 export function createMockBlobBackend(seed: Record<string, Uint8Array | string> = {}) {
   const blobs = new Map<string, Uint8Array>();
+  const types = new Map<string, string>();
   const calls: RecordedCall[] = [];
 
   for (const [key, value] of Object.entries(seed)) {
@@ -209,8 +210,21 @@ export function createMockBlobBackend(seed: Record<string, Uint8Array | string> 
       if (!bytes) return new Response('missing blob', { status: 404, statusText: 'Not Found' });
       return new Response(bytes, { status: 200 });
     }
+    if (method === 'HEAD') {
+      const bytes = blobs.get(input);
+      if (!bytes) return new Response(null, { status: 404, statusText: 'Not Found' });
+      return new Response(null, {
+        status: 200,
+        headers: { 'Content-Type': types.get(input) ?? 'application/octet-stream', 'Content-Length': String(bytes.byteLength) },
+      });
+    }
     if (method === 'PUT' || method === 'POST') {
+      // Honours If-None-Match: * like S3/R2 conditional writes.
+      if (headers['if-none-match'] === '*' && blobs.has(input)) {
+        return new Response('exists', { status: 412, statusText: 'Precondition Failed' });
+      }
       blobs.set(input, await bodyToBytes(init?.body));
+      if (headers['content-type']) types.set(input, headers['content-type']);
       return new Response(null, { status: 204 });
     }
     if (method === 'DELETE') {
